@@ -8,4 +8,4 @@ jobs:
       - name: Run test suite
         shell: pwsh
         run: |
-          .\Test-CodexBar.ps1 -Verbose
+          .\Test-AIUsageBar.ps1 -Verbose
