@@ -1,2 +1,12 @@
+# logs and local app data
 *.log
-.codexbar-win/
+.aiusagebar/
+
+# build output and binaries (publish exes through GitHub Releases, not the repo)
+dist/
+*.exe
+*.zip
+
+# personal backups and experiments
+backups/
+experiments/
