@@ -4,7 +4,7 @@
 #
 # The exe is not code-signed. Windows SmartScreen or antivirus may warn about it;
 # if you would rather not trust a binary, run the .ps1 directly (see README.md).
-param([string]$Version = "1.0.5.0")
+param([string]$Version = "1.0.6.0")
 
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot

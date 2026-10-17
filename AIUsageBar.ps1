@@ -199,7 +199,9 @@ function Get-ClaudeConstants {
         UsageUrl         = 'https://api.anthropic.com/api/oauth/usage'
         # 토큰 갱신 요청은 Claude Code(Axios)와 같은 식별 문자열이어야 WAF에 막히지 않는다
         RefreshUserAgent = 'axios/1.13.6'
-        UsageUserAgent   = 'AIUsageBar-Win/1.0'
+        # 사용량 엔드포인트는 요청 식별 문자열별로 한도를 둔다. 일반 문자열은 곧바로 429가 나므로
+        # Claude Code와 같은 형식을 쓴다. 막히면 AIUSAGEBAR_CLAUDE_USER_AGENT 로 바꿀 수 있다.
+        UsageUserAgent   = if ($env:AIUSAGEBAR_CLAUDE_USER_AGENT) { $env:AIUSAGEBAR_CLAUDE_USER_AGENT } else { 'claude-code/2.1.0' }
     }
 }
 

@@ -92,6 +92,7 @@ Refreshed tokens stay in memory; your CLI login is never modified.
 | `AIUSAGEBAR_CLAUDE_REFRESH=1` | Same as `-AllowClaudeTokenRefresh` |
 | `AIUSAGEBAR_CLAUDE_OAUTH_TOKEN` | Use this Claude token instead of the login file |
 | `AIUSAGEBAR_AGY_OAUTH_CLIENT_SECRET` | Enables Antigravity token renewal |
+| `AIUSAGEBAR_CLAUDE_USER_AGENT` | Override the Claude usage request identifier (use if Claude starts answering 429 again) |
 | `AIUSAGEBAR_AGY_USER_AGENT` | Override the Antigravity request identifier (use if Google changes what it accepts) |
 
 Endpoints and identifiers live together in `Get-ClaudeConstants` and `Get-AntigravityConstants` near the top of `AIUsageBar.ps1`.
