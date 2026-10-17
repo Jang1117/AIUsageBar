@@ -438,6 +438,13 @@ Assert-Equal 0 $script:ClaudeFailCount "Successful Claude refresh clears failure
 Assert-True ($script:ClaudeDetailItem.Text -notmatch 'cached|retrying|failed') "Successful Claude refresh restores normal weekly display"
 Assert-Equal 'now' (Format-TimeRemaining -ResetAt ([DateTimeOffset]::UtcNow.AddMinutes(-1).ToUnixTimeSeconds())) "Expired Unix reset time shows now"
 Assert-Equal '?' (Format-TimeRemaining -ResetAt '999999999999999999999999') "Invalid Unix reset timestamp is handled safely"
+# PowerShell 7 hands JSON dates over as [DateTime]; the local-time form must not shift by the UTC offset
+$in125 = [DateTime]::UtcNow.AddMinutes(125)
+Assert-True ((Format-TimeRemaining -ResetAt $in125) -match '^2h[45]m$') "Reset given as a UTC DateTime is read correctly"
+Assert-True ((Format-TimeRemaining -ResetAt $in125.ToLocalTime()) -match '^2h[45]m$') "Reset given as a local DateTime is not shifted by the UTC offset"
+Assert-True ((Format-TimeRemaining -ResetAt ([DateTimeOffset]$in125)) -match '^2h[45]m$') "Reset given as a DateTimeOffset is read correctly"
+Assert-True ((Format-TimeRemaining -ResetAt $in125.ToString('o')) -match '^2h[45]m$') "Reset given as an ISO string is read correctly"
+Assert-Equal '?' (Format-TimeRemaining -ResetAt $null) "Missing reset time shows a question mark"
 
 # --- Test 13: Token lifetime and refresh stay in-process and read-only ---
 Write-Host "[13] Antigravity token refresh..." -ForegroundColor Yellow

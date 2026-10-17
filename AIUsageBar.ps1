@@ -642,6 +642,25 @@ function Fetch-CodexUsage {
 }
 
 
+function ConvertTo-AntigravityResetString {
+    # 리셋 시각을 PowerShell 5.1과 7에서 똑같이 "yyyy-MM-ddTHH:mm:ssZ" 문자열로 맞춘다
+    # (7은 JSON의 날짜 문자열을 [DateTime]으로 바꿔서 돌려준다).
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    $format = "yyyy-MM-dd'T'HH:mm:ss'Z'"
+    $invariant = [System.Globalization.CultureInfo]::InvariantCulture
+    if ($Value -is [DateTimeOffset]) { return $Value.UtcDateTime.ToString($format, $invariant) }
+    if ($Value -is [DateTime]) {
+        $utc = switch ($Value.Kind) {
+            'Utc'   { $Value }
+            'Local' { $Value.ToUniversalTime() }
+            default { [DateTime]::SpecifyKind($Value, 'Utc') }
+        }
+        return $utc.ToString($format, $invariant)
+    }
+    return [string]$Value
+}
+
 function Parse-AntigravityUsageJson {
     param([string]$JsonText)
     if (-not $JsonText) { return $null }
@@ -689,7 +708,7 @@ function Parse-AntigravityUsageJson {
                     RemainingFraction = $remFrac
                     RemainingPercent  = $remPercent
                     UsedPercent       = $usedPercent
-                    ResetTime         = @($b.resetTime, $b.reset_time, $b.resetAt, $b.reset_at) | Where-Object { $_ } | Select-Object -First 1
+                    ResetTime         = ConvertTo-AntigravityResetString (@($b.resetTime, $b.reset_time, $b.resetAt, $b.reset_at) | Where-Object { $_ } | Select-Object -First 1)
                 }
 
                 $label = "$($bucketObj.Id) $($bucketObj.Name) $($b.window)"
@@ -876,7 +895,7 @@ function Start-AntigravityPoll {
     if ($script:AgyWorker) { return }
     try {
         Initialize-AntigravityCredentialReader
-        $definitions = foreach ($name in @('Get-AntigravityConstants', 'Initialize-AntigravityCredentialReader', 'ConvertFrom-AntigravityCredentialBlob',
+        $definitions = foreach ($name in @('Get-AntigravityConstants', 'ConvertTo-AntigravityResetString', 'Initialize-AntigravityCredentialReader', 'ConvertFrom-AntigravityCredentialBlob',
             'Get-AntigravityCredential', 'Get-AntigravityAccessToken', 'Invoke-AntigravityQuotaRequest',
             'Parse-AntigravityUsageJson', 'Invoke-AntigravityDirectPoll')) {
             "function $name { $((Get-Item ('function:' + $name)).ScriptBlock.ToString()) }"
@@ -961,13 +980,24 @@ function Check-AntigravityPoll {
 # --- UI Helpers ---
 
 function Format-TimeRemaining {
-    param([string]$ResetAt)
-    if (-not $ResetAt) { return "?" }
+    # $ResetAt: ISO 문자열, epoch 초, [DateTime] 또는 [DateTimeOffset].
+    # PowerShell 7은 JSON의 ISO 날짜 문자열을 [DateTime]으로 바꿔 주는데, 이것을 [string]으로 바꾸면
+    # 시간대 정보가 사라져("10/18/2026 10:00:00") UTC가 아닌 지역에서 시차만큼 틀어진다. 그래서 형식을 먼저 구분한다.
+    param($ResetAt)
+    if ($null -eq $ResetAt -or "$ResetAt" -eq '') { return "?" }
     try {
-        $resetTime = if ($ResetAt -match '^\d+$') {
-            [DateTimeOffset]::FromUnixTimeSeconds([long]$ResetAt).UtcDateTime
+        $resetTime = if ($ResetAt -is [DateTimeOffset]) {
+            $ResetAt.UtcDateTime
+        } elseif ($ResetAt -is [DateTime]) {
+            switch ($ResetAt.Kind) {
+                'Utc'   { $ResetAt }
+                'Local' { $ResetAt.ToUniversalTime() }
+                default { [DateTime]::SpecifyKind($ResetAt, 'Utc') }
+            }
+        } elseif ("$ResetAt" -match '^\d+$') {
+            [DateTimeOffset]::FromUnixTimeSeconds([long]"$ResetAt").UtcDateTime
         } else {
-            [DateTimeOffset]::Parse($ResetAt).UtcDateTime
+            [DateTimeOffset]::Parse("$ResetAt").UtcDateTime
         }
         $now = [DateTime]::UtcNow
         $diff = $resetTime - $now
