@@ -1,6 +1,6 @@
 # Build AIUsageBar.exe from AIUsageBar.ps1 and write a SHA-256 checksum file.
 #
-#   .\Build.ps1                 # builds dist\AIUsageBar.exe and dist\SHA256SUMS.txt
+#   powershell -ExecutionPolicy Bypass -File .\Build.ps1   # builds dist\AIUsageBar.exe and dist\SHA256SUMS.txt
 #
 # The exe is not code-signed. Windows SmartScreen or antivirus may warn about it;
 # if you would rather not trust a binary, run the .ps1 directly (see README.md).

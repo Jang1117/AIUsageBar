@@ -31,7 +31,7 @@ powershell -ExecutionPolicy Bypass -File AIUsageBar.ps1
 Running the `.ps1` briefly opens a console window. To avoid that, build the exe yourself:
 
 ```powershell
-.\Build.ps1        # installs ps2exe for your user if needed, writes dist\AIUsageBar.exe and dist\SHA256SUMS.txt
+powershell -ExecutionPolicy Bypass -File .\Build.ps1   # installs ps2exe for your user if needed, writes dist\AIUsageBar.exe and dist\SHA256SUMS.txt
 ```
 
 **Prebuilt exe:** download `AIUsageBar.exe` from the [Releases page](https://github.com/Jang1117/AIUsageBar/releases) and compare its SHA-256 with `SHA256SUMS.txt` from the same release. The exe is **not code-signed**, so Windows SmartScreen or your antivirus may warn about it (this is common for exes made with ps2exe).
@@ -109,8 +109,8 @@ Endpoints and identifiers live together in `Get-ClaudeConstants` and `Get-Antigr
 ## Development
 
 ```powershell
-.\Test-AIUsageBar.ps1 -Verbose     # headless test suite (also runs in CI)
-.\Build.ps1                        # build the exe
+powershell -ExecutionPolicy Bypass -File .\Test-AIUsageBar.ps1 -Verbose   # headless test suite (also runs in CI, on PowerShell 7)
+powershell -ExecutionPolicy Bypass -File .\Build.ps1                       # build the exe
 ```
 
 `AIUsageBar.ps1` is the source of truth; the exe is only a build of it.
