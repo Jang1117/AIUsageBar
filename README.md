@@ -7,6 +7,7 @@ A small Windows tray app that shows how much of your **Claude**, **Codex** and *
 - Zero dependencies: PowerShell 5.1+ (built into Windows 10/11), nothing to install.
 - Right-click the tray icon for the panel; the icon and tooltip show your highest usage.
 - Click a 5H or WK row to make the icon follow only that quota. Click again to go back to the highest.
+- Click a provider's title (**CLAUDE**, **CODEX**, **ANTIGRAVITY**) in the panel to switch which model its row shows; the choice is remembered. Claude lists Opus/Sonnet and Codex lists its extra limits (code review, per-model) **only when your plan reports them**. Antigravity quotas are shared per model group (Gemini, Claude+GPT, Gemini 4 Argon) and default to the Gemini group; the last choice, `HIGHEST`, follows the highest group. A model without a 5-hour window shows `NO DATA` for 5H.
 - Green below 50%, cyan below 75%, yellow below 85%, orange below 95%, red from 95%.
 - Refreshes every 60 seconds. If a request fails it keeps the last reading (marked `OLD`) and backs off.
 

@@ -145,6 +145,19 @@ if (Test-Path $script:SelectionFile) {
     } catch {}
 }
 
+# Which model (Claude: Opus/Sonnet, Codex: extra limits, Antigravity: model group) each dashboard
+# row shows. Missing = the provider default (overall quota; Antigravity defaults to the Gemini group).
+$script:ModelChoiceFile = Join-Path $script:ConfigDir "model_choice.json"
+$script:ModelChoice = @{}
+if (Test-Path $script:ModelChoiceFile) {
+    try {
+        $savedChoice = Get-Content $script:ModelChoiceFile -Raw -ErrorAction Stop | ConvertFrom-Json
+        foreach ($prop in $savedChoice.PSObject.Properties) {
+            if ($prop.Name -in @('Claude','Codex','Antigravity') -and $prop.Value) { $script:ModelChoice[$prop.Name] = [string]$prop.Value }
+        }
+    } catch {}
+}
+
 if (Test-Path $script:ClaudeBackoffFile) {
     try {
         $savedAttempt = [DateTime]::Parse((Get-Content $script:ClaudeBackoffFile -Raw -ErrorAction Stop).Trim(), $null, [System.Globalization.DateTimeStyles]::RoundtripKind)
@@ -551,7 +564,18 @@ function Fetch-ClaudeUsage {
                 }
             }
 
-            Write-Log "Claude: 5h=$($result.FiveHour.Utilization)% 7d=$($result.SevenDay.Utilization)%"
+            # Per-model weekly limits (Opus/Sonnet) exist only on some plans; null otherwise.
+            $models = @()
+            foreach ($pair in @(@('Opus', 'seven_day_opus'), @('Sonnet', 'seven_day_sonnet'))) {
+                $w = $response.($pair[1])
+                if ($w -and $null -ne $w.utilization) {
+                    $models += @{ Name = $pair[0]; FiveHour = $null; SevenDay = @{ Utilization = [math]::Round($w.utilization, 1); ResetsAt = $w.resets_at } }
+                }
+            }
+            $result.Models = $models
+            $modelNote = if ($models.Count) { ' models: ' + (($models | ForEach-Object { "$($_.Name) $($_.SevenDay.Utilization)%" }) -join ', ') } else { '' }
+
+            Write-Log "Claude: 5h=$($result.FiveHour.Utilization)% 7d=$($result.SevenDay.Utilization)%$modelNote"
             return $result
         } catch {
             $statusCode = $_.Exception.Response.StatusCode.value__
@@ -630,6 +654,27 @@ function Fetch-CodexUsage {
                 ResetAt     = $rateLimit.secondary_window.reset_at
                 WindowSecs  = $rateLimit.secondary_window.limit_window_seconds
             }
+        }
+
+        # Extra per-feature limits (e.g. code review, per-model); null on plans without them.
+        $result.Extra = @()
+        $extraSources = @()
+        foreach ($limit in @($response.additional_rate_limits)) {
+            if ($limit) {
+                $limitName = if ($limit.limit_name) { $limit.limit_name } elseif ($limit.metered_feature) { $limit.metered_feature } else { 'Extra' }
+                $extraSources += @{ Name = [string]$limitName; Limit = $limit.rate_limit }
+            }
+        }
+        if ($response.code_review_rate_limit) { $extraSources += @{ Name = 'Code review'; Limit = $response.code_review_rate_limit } }
+        foreach ($src in $extraSources) {
+            $extraWindows = @()
+            foreach ($pair in @(@('Primary', 'primary_window'), @('Weekly', 'secondary_window'))) {
+                $w = $src.Limit.($pair[1])
+                if ($w -and $null -ne $w.used_percent) {
+                    $extraWindows += @{ Name = $pair[0]; UsedPercent = [math]::Round($w.used_percent, 1); ResetAt = $w.reset_at; WindowSecs = $w.limit_window_seconds }
+                }
+            }
+            if ($extraWindows.Count) { $result.Extra += @{ Name = $src.Name; Windows = $extraWindows } }
         }
 
         $primary = if ($result.Windows.Count -gt 0) { "$($result.Windows[0].UsedPercent)%" } else { "?" }
@@ -1036,9 +1081,81 @@ function Get-PixelQuotaHit {
     if ($X -lt 12 -or $X -gt 403 -or $Y -lt 40 -or $Y -ge 346) { return $null }
     $index = [int][math]::Floor(($Y-40)/102)
     $offset = ($Y-40)%102
+    if ($offset -lt 27) { return @{Provider=@('Claude','Codex','Antigravity')[$index];Period=$null;Title=$true} }
     $period = if ($offset -ge 30 -and $offset -lt 55) { '5H' } elseif ($offset -ge 59 -and $offset -lt 84) { 'WK' } else { $null }
     if (-not $period) { return $null }
     return @{Provider=@('Claude','Codex','Antigravity')[$index];Period=$period}
+}
+
+function Get-AntigravityGroupShortName {
+    param([string]$Name)
+    $short = ($Name -replace '(?i)\s+models?\s*$', '') -replace '(?i)\s+and\s+', '-'
+    return $short.Trim()
+}
+
+function Get-PixelModelOptions {
+    # Choices for a provider's title click. '__auto__' = overall quota (Antigravity: highest group).
+    param([string]$Provider)
+    switch ($Provider) {
+        'Claude'      { return @('__auto__') + @(@($script:PixelClaudeUsage.Models) | Where-Object { $_ } | ForEach-Object { $_.Name }) }
+        'Codex'       { return @('__auto__') + @(@($script:PixelCodexUsage.Extra) | Where-Object { $_ } | ForEach-Object { $_.Name }) }
+        'Antigravity' { return @(@($script:PixelAntigravityUsage.Groups) | Where-Object { $_ } | ForEach-Object { $_.Name }) + @('__auto__') }
+    }
+    return @('__auto__')
+}
+
+function Get-PixelModelChoice {
+    param([string]$Provider)
+    $options = @(Get-PixelModelOptions $Provider)
+    $saved = $script:ModelChoice[$Provider]
+    if ($saved -and $saved -in $options) { return $saved }
+    if ($Provider -eq 'Antigravity') {
+        $gemini = @($options | Where-Object { $_ -match '^Gemini Models?$' } | Select-Object -First 1)
+        if (-not $gemini[0]) { $gemini = @($options | Where-Object { $_ -match '^Gemini' } | Select-Object -First 1) }
+        if ($gemini[0]) { return [string]$gemini[0] }
+    }
+    return '__auto__'
+}
+
+function Get-PixelModelData {
+    # The chosen model/group object, or $null when showing the overall quota.
+    param([string]$Provider)
+    $choice = Get-PixelModelChoice $Provider
+    if ($choice -eq '__auto__') { return $null }
+    $items = switch ($Provider) {
+        'Claude'      { @($script:PixelClaudeUsage.Models) }
+        'Codex'       { @($script:PixelCodexUsage.Extra) }
+        'Antigravity' { @($script:PixelAntigravityUsage.Groups) }
+    }
+    return @($items | Where-Object { $_ -and $_.Name -eq $choice } | Select-Object -First 1)[0]
+}
+
+function Get-PixelModelTitle {
+    param([string]$Provider)
+    $base = $Provider.ToUpperInvariant()
+    $choice = Get-PixelModelChoice $Provider
+    if ($choice -eq '__auto__') { return $(if ($Provider -eq 'Antigravity') { "$base - HIGHEST" } else { $base }) }
+    return "$base - $(Get-AntigravityGroupShortName $choice)"
+}
+
+function Get-NextPixelModelChoice {
+    param($Options, [string]$Current)
+    $list = @($Options)
+    if ($list.Count -eq 0) { return '__auto__' }
+    $i = [array]::IndexOf($list, $Current)
+    return [string]$list[($i + 1) % $list.Count]
+}
+
+function Switch-PixelModel {
+    param([string]$Provider)
+    $options = @(Get-PixelModelOptions $Provider)
+    if ($options.Count -le 1) { return }
+    $script:ModelChoice[$Provider] = Get-NextPixelModelChoice -Options $options -Current (Get-PixelModelChoice $Provider)
+    try { $script:ModelChoice | ConvertTo-Json -Compress | Set-Content -LiteralPath $script:ModelChoiceFile -ErrorAction Stop }
+    catch { Write-Log 'Unable to save model selection' 'WARN' }
+    # Uses cached readings only, never an extra API request.
+    Update-PixelTrayIcon
+    Update-PixelUsageFrame
 }
 
 function Get-PixelTrayReading {
@@ -1059,6 +1176,10 @@ function Update-PixelTrayIcon {
     if ($oldIcon) { $oldIcon.Dispose() }
     $shownPeriod = if ($row.DisplayPeriod) { $row.DisplayPeriod } else { $script:SelectedPeriod }
     $label = if ($script:SelectedProvider) { "$($script:SelectedProvider) $shownPeriod" } else { 'Highest' }
+    if ($script:SelectedProvider) {
+        $modelChoice = Get-PixelModelChoice $script:SelectedProvider
+        if ($modelChoice -ne '__auto__') { $label = "$($script:SelectedProvider) $(Get-AntigravityGroupShortName $modelChoice) $shownPeriod" }
+    }
     $value = if ($missing) { 'No data' } else { "$($row.Used)%" }
     $old = if ($row.Old) { ' OLD' } else { '' }
     $tooltip = "AIUsageBar - $label`: $value$old"
@@ -1164,6 +1285,8 @@ $script:PixelGlyphs = @{
     '9' = '01110/10001/10001/01111/00001/00001/01110'
     '%' = '11001/11010/00010/00100/01000/01011/10011'
     '-' = '00000/00000/00000/11111/00000/00000/00000'
+    '.' = '00000/00000/00000/00000/00000/01100/01100'
+    '/' = '00001/00001/00010/00100/01000/10000/10000'
     '?' = '01110/10001/00001/00010/00100/00000/00100'
     ' ' = '00000/00000/00000/00000/00000/00000/00000'
 }
@@ -1175,8 +1298,9 @@ $script:PixelIconData = @{
 
 # Pixel face uses the app's cached readings; animation never polls a provider.
 function Get-PixelCodexQuota {
-    param([string]$Period)
-    $windows = @($script:PixelCodexUsage.Windows | Where-Object { $null -ne $_ })
+    param([string]$Period, $Windows = $null)
+    if ($null -eq $Windows) { $Windows = $script:PixelCodexUsage.Windows }
+    $windows = @($Windows | Where-Object { $null -ne $_ })
     $weekly = $windows | Where-Object { $_.WindowSecs -eq 604800 } | Select-Object -First 1
     $primary = $windows | Where-Object { $_.WindowSecs -ne 604800 } | Select-Object -First 1
     if ($Period -eq '5H') { return $primary }
@@ -1200,11 +1324,17 @@ function Get-PixelUsageRows {
     param([string]$Period)
     $rows = @()
     $claude = $script:PixelClaudeUsage
+    $claudeModel = Get-PixelModelData 'Claude'
+    if ($claudeModel) { $claude = $claudeModel }
     $quota = if ($Period -eq '5H') { $claude.FiveHour } else { $claude.SevenDay }
     $rows += @{ Provider = 'claude'; Period = $Period; Label = 'CLAUDE A'; Used = $quota.Utilization; Reset = $quota.ResetsAt; Old = $script:PixelClaudeOld }
-    $quota = Get-PixelCodexQuota $Period
+    $codexModel = Get-PixelModelData 'Codex'
+    $quota = if ($codexModel) { Get-PixelCodexQuota $Period -Windows $codexModel.Windows } else { Get-PixelCodexQuota $Period }
     $rows += @{ Provider = 'codex'; Period = $Period; DisplayPeriod = (Get-PixelQuotaPeriod $quota $Period); Label = 'CODEX A'; Used = $quota.UsedPercent; Reset = $quota.ResetAt; Old = $false }
-    $windows = @($script:PixelAntigravityUsage.Groups | ForEach-Object {
+    $agyGroups = @($script:PixelAntigravityUsage.Groups)
+    $chosenGroup = Get-PixelModelData 'Antigravity'
+    if ($chosenGroup) { $agyGroups = @($chosenGroup) }
+    $windows = @($agyGroups | ForEach-Object {
         if ($Period -eq '5H') { $_.FiveHour } else { $_.Weekly }
     } | Where-Object { $null -ne $_ -and $null -ne $_.UsedPercent } | Sort-Object { [double]$_.UsedPercent } -Descending)
     $quota = $windows | Select-Object -First 1
@@ -1277,6 +1407,18 @@ function New-PixelUsageTemplate {
 function Draw-PixelUsageValues {
     param($Graphics, [string]$Period, [bool]$UseCache = $false)
     $g = $Graphics
+    if (-not $script:PixelTitleKeys) { $script:PixelTitleKeys = @{} }
+    for ($t = 0; $t -lt 3; $t++) {
+        $title = Get-PixelModelTitle @('Claude','Codex','Antigravity')[$t]
+        if ($UseCache -and $script:PixelTitleKeys[$t] -eq $title) { continue }
+        $titleY = 40 + $t * 102 + 8
+        $g.FillRectangle($script:PixelBackgroundBrush, 14, $titleY - 2, 386, 16)
+        Draw-PixelText $g 18 $titleY $title.Substring(0, [math]::Min(31, $title.Length)) 2
+        if ($UseCache) {
+            $script:PixelTitleKeys[$t] = $title
+            $script:PixelPicture.Invalidate([System.Drawing.Rectangle]::new(14, $titleY - 2, 386, 16))
+        }
+    }
     foreach ($periodName in @('5H','WK')) {
         $rows = @(Get-PixelUsageRows $periodName)
         $offset = if ($periodName -eq '5H') { 30 } else { 59 }
@@ -1475,8 +1617,15 @@ function Initialize-PixelUsageView {
         param($sender, $eventArgs)
         if ($eventArgs.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
             $hit = Get-PixelQuotaHit $eventArgs.X $eventArgs.Y
-            if ($hit) { Set-PixelQuotaSelection $hit.Provider $hit.Period }
+            if ($hit -and $hit.Title) { Switch-PixelModel $hit.Provider }
+            elseif ($hit) { Set-PixelQuotaSelection $hit.Provider $hit.Period }
         }
+    })
+    $script:PixelPicture.Add_MouseMove({
+        param($sender, $eventArgs)
+        $hit = Get-PixelQuotaHit $eventArgs.X $eventArgs.Y
+        $clickable = $hit -and (-not $hit.Title -or @(Get-PixelModelOptions $hit.Provider).Count -gt 1)
+        $sender.Cursor = if ($clickable) { [System.Windows.Forms.Cursors]::Hand } else { [System.Windows.Forms.Cursors]::Default }
     })
     Update-PixelUsageFrame
     $hostItem = [System.Windows.Forms.ToolStripControlHost]::new($script:PixelPicture)

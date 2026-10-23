@@ -580,6 +580,106 @@ foreach ($name in @('AIUsageBar.ps1', 'README.md', 'Install-Startup.ps1', 'Start
 
 # --- Results ---
 Write-Host ""
+# --- Test 16: Model / group choice on the dashboard (Claude, Codex, Antigravity) ---
+Write-Host "[16] Model choice per provider..." -ForegroundColor Yellow
+$modelFunctions = @('Get-AntigravityGroupShortName', 'Get-PixelModelOptions', 'Get-PixelModelChoice', 'Get-PixelModelData',
+    'Get-PixelModelTitle', 'Get-NextPixelModelChoice', 'Get-PixelUsageRows', 'Get-PixelCodexQuota', 'Get-PixelQuotaPeriod', 'Get-PixelQuotaHit')
+foreach ($definition in $ast.FindAll({ param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $modelFunctions
+}, $true)) {
+    . ([scriptblock]::Create($definition.Extent.Text))
+}
+function New-TestWindow($used) { @{ UsedPercent = $used; ResetTime = '2026-01-01T00:00:00Z' } }
+$script:PixelAntigravityOld = $false; $script:PixelClaudeOld = $false
+$script:PixelAntigravityUsage = @{ Groups = @(
+    @{ Name = 'Gemini Models';         FiveHour = (New-TestWindow 5);   Weekly = (New-TestWindow 34) },
+    @{ Name = 'Claude and GPT models'; FiveHour = (New-TestWindow 100); Weekly = (New-TestWindow 71) },
+    @{ Name = 'Gemini 4 Argon';        FiveHour = $null;                Weekly = (New-TestWindow 5.4) }
+) }
+$script:PixelClaudeUsage = @{
+    FiveHour = @{ Utilization = 4;  ResetsAt = '2026-01-01T00:00:00Z' }
+    SevenDay = @{ Utilization = 32; ResetsAt = '2026-01-01T00:00:00Z' }
+    Models   = @( @{ Name = 'Opus'; FiveHour = $null; SevenDay = @{ Utilization = 61; ResetsAt = '2026-01-01T00:00:00Z' } } )
+}
+$script:PixelCodexUsage = @{
+    Windows = @( @{ UsedPercent = 7; WindowSecs = 18000; ResetAt = 1 }, @{ UsedPercent = 9; WindowSecs = 604800; ResetAt = 1 } )
+    Extra   = @( @{ Name = 'Code review'; Windows = @( @{ UsedPercent = 44; WindowSecs = 604800; ResetAt = 1 } ) } )
+}
+$script:ModelChoice = @{}
+function Get-Row($provider, $period) { (Get-PixelUsageRows $period) | Where-Object { $_.Provider -eq $provider } }
+
+# 기본값
+Assert-Equal 'Gemini Models' (Get-PixelModelChoice 'Antigravity') "Antigravity defaults to the Gemini group"
+Assert-Equal 5 (Get-Row 'antigravity' '5H').Used "Default Antigravity row shows Gemini, not the highest group"
+Assert-Equal '__auto__' (Get-PixelModelChoice 'Claude') "Claude defaults to the overall quota"
+Assert-Equal 4 (Get-Row 'claude' '5H').Used "Default Claude row is the overall 5H quota"
+Assert-Equal 7 (Get-Row 'codex' '5H').Used "Default Codex row is the overall 5H quota"
+
+# Antigravity 선택
+$script:ModelChoice['Antigravity'] = '__auto__'
+Assert-Equal 100 (Get-Row 'antigravity' '5H').Used "Explicit automatic mode follows the highest group"
+$script:ModelChoice['Antigravity'] = 'Gemini 4 Argon'
+Assert-True ($null -eq (Get-Row 'antigravity' '5H').Used) "A group without a 5H window shows no data instead of another group's value"
+Assert-Equal 5.4 (Get-Row 'antigravity' 'WK').Used "Argon weekly quota is readable"
+$script:ModelChoice['Antigravity'] = 'Group that no longer exists'
+Assert-Equal 'Gemini Models' (Get-PixelModelChoice 'Antigravity') "An unknown saved group falls back to the default"
+
+# Claude / Codex 모델 선택
+$script:ModelChoice['Claude'] = 'Opus'
+Assert-Equal 61 (Get-Row 'claude' 'WK').Used "Choosing Opus shows the Opus weekly quota"
+Assert-True ($null -eq (Get-Row 'claude' '5H').Used) "Opus has no 5H window, so 5H shows no data"
+$script:ModelChoice['Codex'] = 'Code review'
+Assert-Equal 44 (Get-Row 'codex' 'WK').Used "Choosing a Codex extra limit shows its own window"
+$script:ModelChoice = @{}
+
+# 선택지·순환
+Assert-Equal '__auto__|Opus' ((Get-PixelModelOptions 'Claude') -join '|') "Claude options: overall + available models"
+Assert-Equal '__auto__' ((Get-PixelModelOptions 'Codex')[0]) "Codex options start with the overall quota"
+$script:PixelClaudeUsage = @{ FiveHour = @{ Utilization = 4 }; SevenDay = @{ Utilization = 32 }; Models = @() }
+Assert-Equal 1 @(Get-PixelModelOptions 'Claude').Count "No per-model data: nothing to switch to"
+$seen = @(); $cur = 'Gemini Models'
+$options = Get-PixelModelOptions 'Antigravity'
+for ($i = 0; $i -lt 4; $i++) { $cur = Get-NextPixelModelChoice -Options $options -Current $cur; $seen += $cur }
+Assert-Equal 'Claude and GPT models|Gemini 4 Argon|__auto__|Gemini Models' ($seen -join '|') "Clicking cycles Gemini -> Claude-GPT -> Argon -> highest -> Gemini"
+
+# 표시 이름·히트 영역
+Assert-Equal 'Gemini' (Get-AntigravityGroupShortName 'Gemini Models') "Short name drops 'Models'"
+Assert-Equal 'Claude-GPT' (Get-AntigravityGroupShortName 'Claude and GPT models') "Short name joins 'and'"
+Assert-Equal 'ANTIGRAVITY - GEMINI' (Get-PixelModelTitle 'Antigravity') "Title shows the default Gemini group"
+Assert-Equal 'CLAUDE' (Get-PixelModelTitle 'Claude') "Title stays plain when the overall quota is shown"
+foreach ($row in 0..2) {
+    $hit = Get-PixelQuotaHit 100 (40 + $row * 102 + 10)
+    Assert-True ($hit.Title -eq $true -and $hit.Provider -eq @('Claude','Codex','Antigravity')[$row]) "Title row $row is clickable"
+}
+Assert-True ((Get-PixelQuotaHit 100 (40 + 35)).Title -ne $true) "Quota rows still select the tray source"
+
+# --- Test 17: per-model readings from the Claude and Codex usage responses ---
+Write-Host "[17] Claude/Codex model parsing..." -ForegroundColor Yellow
+foreach ($definition in $ast.FindAll({ param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in @('Fetch-ClaudeUsage', 'Fetch-CodexUsage', 'Get-ClaudeConstants', 'Get-JwtClaim')
+}, $true)) {
+    . ([scriptblock]::Create($definition.Extent.Text))
+}
+function Write-Log { param($Message, $Level) }
+function Invoke-RestMethod { param($Uri, $Method, $Headers, $TimeoutSec, $ErrorAction) return $script:FakeResponse }
+$script:AllowClaudeTokenRefresh = $false
+$script:FakeResponse = '{"five_hour":{"utilization":4.0,"resets_at":"2026-10-23T11:49:59+00:00"},"seven_day":{"utilization":32.0,"resets_at":"2026-10-25T21:59:59+00:00"},"seven_day_opus":{"utilization":61.5,"resets_at":"2026-10-25T21:59:59+00:00"},"seven_day_sonnet":null}' | ConvertFrom-Json
+$c = Fetch-ClaudeUsage -Creds @{ Token = 'x' }
+Assert-Equal 1 @($c.Models).Count "Only non-null Claude model limits are listed"
+Assert-Equal 'Opus' $c.Models[0].Name "Claude Opus limit is read"
+Assert-Equal 61.5 $c.Models[0].SevenDay.Utilization "Claude Opus weekly utilization is read"
+$script:FakeResponse = '{"five_hour":{"utilization":4.0,"resets_at":"2026-10-23T11:49:59+00:00"},"seven_day":{"utilization":32.0,"resets_at":"2026-10-25T21:59:59+00:00"},"seven_day_opus":null,"seven_day_sonnet":null}' | ConvertFrom-Json
+Assert-Equal 0 @((Fetch-ClaudeUsage -Creds @{ Token = 'x' }).Models).Count "Plans without model limits get an empty list"
+
+$script:FakeResponse = '{"plan_type":"team","rate_limit":{"primary_window":{"used_percent":7,"limit_window_seconds":18000,"reset_at":1},"secondary_window":{"used_percent":9,"limit_window_seconds":604800,"reset_at":2}},"code_review_rate_limit":{"primary_window":{"used_percent":44,"limit_window_seconds":604800,"reset_at":3}},"additional_rate_limits":[{"limit_name":"GPT-5.3-Codex-Spark","rate_limit":{"primary_window":{"used_percent":12,"limit_window_seconds":18000,"reset_at":4},"secondary_window":{"used_percent":20,"limit_window_seconds":604800,"reset_at":5}}}]}' | ConvertFrom-Json
+$x = Fetch-CodexUsage -Creds @{ Token = 'x' }
+Assert-Equal 2 @($x.Windows).Count "Codex overall windows are unchanged"
+Assert-Equal 'GPT-5.3-Codex-Spark|Code review' (@($x.Extra | ForEach-Object { $_.Name }) -join '|') "Codex extra limits are read"
+Assert-Equal 20 $x.Extra[0].Windows[1].UsedPercent "Codex extra weekly window is read"
+$script:FakeResponse = '{"plan_type":"team","rate_limit":{"primary_window":{"used_percent":7,"limit_window_seconds":18000,"reset_at":1}},"code_review_rate_limit":null,"additional_rate_limits":null}' | ConvertFrom-Json
+Assert-Equal 0 @((Fetch-CodexUsage -Creds @{ Token = 'x' }).Extra).Count "Codex without extra limits gets an empty list"
+Remove-Item -LiteralPath function:Invoke-RestMethod
+
 Write-Host "=== Results ===" -ForegroundColor Cyan
 Write-Host "  Passed: $passed" -ForegroundColor Green
 if ($failed -gt 0) {
