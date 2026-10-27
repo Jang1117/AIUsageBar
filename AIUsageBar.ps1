@@ -9,6 +9,8 @@ param(
     [switch]$Debug,
     [switch]$Install,
     [switch]$Uninstall,
+    # Send the daily "hi" ping to every provider right now, wait for it, then exit.
+    [switch]$SendHiNow,
     # Claude 토큰 갱신을 앱이 직접 하도록 허용한다 (기본: 끔, 읽기 전용).
     # 켜면 ~/.claude/.credentials.json 을 다시 쓰므로 Claude Code 로그인과 충돌할 수 있다. README 참고.
     [switch]$AllowClaudeTokenRefresh,
@@ -71,7 +73,9 @@ if ($Install) {
 }
 
 # Migrate an existing source-based shortcut without changing startup opt-in.
-if (Test-Path -LiteralPath $shortcutPath) {
+# A '.no-startup-migration' file next to the app (used by a test copy) leaves the startup shortcut alone.
+$skipMigration = Test-Path -LiteralPath (Join-Path (Split-Path $scriptPath) '.no-startup-migration')
+if ((Test-Path -LiteralPath $shortcutPath) -and -not $skipMigration) {
     New-StartupShortcut -ShortcutPath $shortcutPath -TargetScriptPath $scriptPath
 }
 
@@ -1207,43 +1211,77 @@ function Set-PixelQuotaSelection {
     Update-PixelUsageFrame
 }
 
+function New-TrayIconBitmap {
+    param([int]$Size, [string]$Text, [System.Drawing.Color]$Fill, [System.Drawing.Color]$TextColor)
+    $bmp = New-Object System.Drawing.Bitmap($Size, $Size)
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $brush = New-Object System.Drawing.SolidBrush($Fill)
+    $textBrush = New-Object System.Drawing.SolidBrush($TextColor)
+    $fmt = [System.Drawing.StringFormat]::GenericTypographic.Clone()
+    try {
+        $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
+        $g.FillEllipse($brush, 0, 0, $Size, $Size)
+
+        if (-not $Text) { return $bmp }
+        $fmt.Alignment = [System.Drawing.StringAlignment]::Center
+        $fmt.LineAlignment = [System.Drawing.StringAlignment]::Center
+        $fmt.FormatFlags = $fmt.FormatFlags -bor [System.Drawing.StringFormatFlags]::NoWrap -bor [System.Drawing.StringFormatFlags]::NoClip
+        $scale = if ($Text.Length -ge 3) { 0.46 } else { 0.64 }
+        $font = New-Object System.Drawing.Font("Malgun Gothic", [single]($Size * $scale), [System.Drawing.FontStyle]::Bold, [System.Drawing.GraphicsUnit]::Pixel)
+        try {
+            $rect = New-Object System.Drawing.RectangleF(0, 0, [single]$Size, [single]($Size + 1))
+            $g.DrawString($Text, $font, $textBrush, $rect, $fmt)
+        } finally { $font.Dispose() }
+    } finally {
+        $fmt.Dispose(); $textBrush.Dispose(); $brush.Dispose(); $g.Dispose()
+    }
+    return $bmp
+}
+
 function Get-TrayIcon {
     param([double]$MaxUsage, [bool]$NotConnected = $false)
-    $size = 16
-    $bmp = New-Object System.Drawing.Bitmap($size, $size)
-    $g = [System.Drawing.Graphics]::FromImage($bmp)
-    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-
     if ($NotConnected) {
-        # Gray circle with a white "!" for unauthenticated state
-        $color = [System.Drawing.Color]::FromArgb(120, 120, 120)
-        $brush = New-Object System.Drawing.SolidBrush($color)
-        $g.FillEllipse($brush, 1, 1, $size - 2, $size - 2)
-        $font = New-Object System.Drawing.Font("Arial", 9, [System.Drawing.FontStyle]::Bold)
-        $textBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::White)
-        $g.DrawString("!", $font, $textBrush, 4, 0)
-        $font.Dispose()
-        $textBrush.Dispose()
-        $brush.Dispose()
+        $text = '!'
+        $fill = [System.Drawing.Color]::FromArgb(120, 120, 120)
+        $textColor = [System.Drawing.Color]::White
     } else {
-        $color = Get-PixelUsageColor $MaxUsage
-
-        $brush = New-Object System.Drawing.SolidBrush($color)
-        $g.FillEllipse($brush, 1, 1, $size - 2, $size - 2)
-
-        $pen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(60, 0, 0, 0), 2)
-        $sweepAngle = [math]::Min(360, $MaxUsage * 3.6)
-        if ($sweepAngle -gt 0) {
-            $g.DrawArc($pen, 2, 2, $size - 4, $size - 4, -90, $sweepAngle)
-        }
-        $pen.Dispose()
-        $brush.Dispose()
+        $text = ''
+        $fill = Get-PixelUsageColor $MaxUsage
+        # Dark or white digits depending on background luminance, for contrast
+        $lum = (0.299 * $fill.R + 0.587 * $fill.G + 0.114 * $fill.B) / 255
+        $textColor = if ($lum -gt 0.45) { [System.Drawing.Color]::FromArgb(16, 20, 24) } else { [System.Drawing.Color]::White }
     }
 
-    $g.Dispose()
-    $hIcon = $bmp.GetHicon()
-    $icon = [System.Drawing.Icon]::FromHandle($hIcon)
-    return $icon
+    # Multi-size PNG-in-ICO built in memory, each size drawn natively so it stays crisp at
+    # 100%/125%/150% DPI. Bitmap.GetHicon() is avoided: it leaks a GDI handle per call and
+    # eventually throws "generic error in GDI+", freezing the tray icon.
+    $sizes = @(16, 24, 32)
+    $pngs = @()
+    foreach ($sz in $sizes) {
+        $bmp = New-TrayIconBitmap -Size $sz -Text $text -Fill $fill -TextColor $textColor
+        $ms = New-Object System.IO.MemoryStream
+        try {
+            $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+            $pngs += ,($ms.ToArray())
+        } finally { $ms.Dispose(); $bmp.Dispose() }
+    }
+    $ico = New-Object System.IO.MemoryStream
+    $w = New-Object System.IO.BinaryWriter($ico)
+    try {
+        $w.Write([uint16]0); $w.Write([uint16]1); $w.Write([uint16]$sizes.Count)
+        $offset = 6 + 16 * $sizes.Count
+        for ($i = 0; $i -lt $sizes.Count; $i++) {
+            $w.Write([byte]$sizes[$i]); $w.Write([byte]$sizes[$i]); $w.Write([byte]0); $w.Write([byte]0)
+            $w.Write([uint16]1); $w.Write([uint16]32)
+            $w.Write([uint32]$pngs[$i].Length); $w.Write([uint32]$offset)
+            $offset += $pngs[$i].Length
+        }
+        foreach ($png in $pngs) { $w.Write($png) }
+        $w.Flush()
+        $ico.Position = 0
+        return (New-Object System.Drawing.Icon($ico))
+    } finally { $w.Dispose() }
 }
 
 $script:PixelGlyphs = @{
@@ -1501,7 +1539,7 @@ function Resize-PixelPopup {
         $width = $script:PixelPicture.Width
         $height = 2
         foreach ($item in $Menu.Items) {
-            $itemHeight = if ($item -is [System.Windows.Forms.ToolStripControlHost]) { $script:PixelPicture.Height } else { $item.GetPreferredSize([System.Drawing.Size]::Empty).Height }
+            $itemHeight = if ($item -is [System.Windows.Forms.ToolStripControlHost]) { $item.Control.Height } else { $item.GetPreferredSize([System.Drawing.Size]::Empty).Height }
             $item.AutoSize = $false
             $item.Margin = [System.Windows.Forms.Padding]::new(0)
             $item.Size = [System.Drawing.Size]::new($width,$itemHeight)
@@ -1569,6 +1607,7 @@ function Set-PixelPopupToolWindow {
 function Show-PixelPopup {
     param($Menu, [System.Drawing.Rectangle]$WorkingArea = [System.Drawing.Rectangle]::Empty)
     Update-PixelUsageFrame
+    Update-HiPanel
     Resize-PixelPopup $Menu
     if ($WorkingArea.IsEmpty) {
         $WorkingArea = [System.Windows.Forms.Screen]::FromPoint([System.Windows.Forms.Cursor]::Position).WorkingArea
@@ -1645,6 +1684,372 @@ function Stop-PixelUsageView {
 }
 
 
+# --- Daily "hi" ping ---
+# Like earlybolt: the 5-hour usage windows start on the first message, so a one-word
+# message sent early in the morning makes the window reset during working hours.
+# Each provider is pinged through its own official CLI (the CLI owns the login).
+# Four pings a day, spaced a little over 5 hours apart so each lands in a fresh window.
+$script:HiSlots = @('06:00', '11:05', '16:10', '21:15')
+$script:HiGraceMinutes = 120   # app started late: still send a slot until this many minutes after it
+$script:HiStateFile = Join-Path $script:ConfigDir 'hi_state.json'
+$script:HiState = @{ Date = ''; Slots = @{}; Last = @{} }
+$script:HiJobs = @()
+$script:HiUi = $null
+
+function ConvertTo-HiHashtable {
+    param($Obj)
+    if ($Obj -is [System.Management.Automation.PSCustomObject]) {
+        $h = @{}
+        foreach ($prop in $Obj.PSObject.Properties) { $h[$prop.Name] = ConvertTo-HiHashtable $prop.Value }
+        return $h
+    }
+    return $Obj
+}
+
+function Save-HiState {
+    try { $script:HiState | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $script:HiStateFile -Encoding UTF8 -ErrorAction Stop }
+    catch { Write-Log "Hi: cannot save state: $($_.Exception.Message)" 'WARN' }
+}
+
+function Initialize-HiState {
+    $state = @{ Date = ''; Slots = @{}; Last = @{} }
+    try {
+        if (Test-Path -LiteralPath $script:HiStateFile) {
+            $raw = Get-Content -LiteralPath $script:HiStateFile -Raw -ErrorAction Stop
+            if ($raw.Trim()) {
+                $loaded = ConvertTo-HiHashtable (ConvertFrom-Json $raw)
+                foreach ($key in @('Date', 'Slots', 'Last')) { if ($null -ne $loaded[$key]) { $state[$key] = $loaded[$key] } }
+            }
+        }
+    } catch { Write-Log "Hi: cannot read state, starting fresh: $($_.Exception.Message)" 'WARN' }
+    $script:HiState = $state
+    Reset-HiStateIfNewDay
+}
+
+function Reset-HiStateIfNewDay {
+    $today = (Get-Date).ToString('yyyy-MM-dd')
+    if ($script:HiState.Date -ne $today) {
+        $script:HiState.Date = $today
+        $script:HiState.Slots = @{}
+        Save-HiState
+    }
+}
+
+function Set-HiResult {
+    param([string]$Provider, [string]$SlotKey, [bool]$Ok)
+    $time = (Get-Date).ToString('HH:mm')
+    $script:HiState.Last[$Provider] = @{ Ok = $Ok; Time = $time; Slot = $SlotKey }
+    if ($SlotKey -and $script:HiState.Slots.ContainsKey($SlotKey)) {
+        $script:HiState.Slots[$SlotKey].Results[$Provider] = @{ Ok = $Ok; Time = $time }
+    }
+    Save-HiState
+}
+
+function Find-NewestFile {
+    param([string]$Pattern)
+    return Get-ChildItem -Path $Pattern -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
+}
+
+function Resolve-HiCli {
+    param([string]$Name)
+    $cmd = Get-Command $Name -ErrorAction SilentlyContinue | Where-Object { $_.CommandType -eq 'Application' } | Select-Object -First 1
+    if ($cmd) { return $cmd.Source }
+    $ext = Join-Path $env:USERPROFILE '.vscode\extensions'
+    switch ($Name) {
+        'claude' { return Find-NewestFile (Join-Path $ext 'anthropic.claude-code-*\resources\native-binary\claude.exe') }
+        'codex'  { return Find-NewestFile (Join-Path $ext 'openai.chatgpt-*\bin\windows-x86_64\codex.exe') }
+        'agy'    { return Find-NewestFile (Join-Path $env:LOCALAPPDATA 'agy\bin\agy.exe') }
+    }
+}
+
+function Get-HiTargets {
+    # Lightest model per provider; the reply is a single word, so quota use is negligible.
+    return @(
+        @{ Provider = 'Claude';      Cli = 'claude'; Args = '-p hi --model haiku' },
+        @{ Provider = 'Codex';       Cli = 'codex';  Args = 'exec --skip-git-repo-check hi' },
+        @{ Provider = 'Antigravity'; Cli = 'agy';    Args = '-p hi --model gemini-3.8-flash-low' }
+    )
+}
+
+function Start-DailyHi {
+    # SlotKey is a HiSlots entry ('06:00') for scheduled pings or 'manual' for Ping now.
+    param([string]$SlotKey = 'manual')
+    $started = @()
+    foreach ($t in Get-HiTargets) {
+        $exe = Resolve-HiCli $t.Cli
+        if (-not $exe) {
+            Write-Log "Hi: $($t.Provider) CLI '$($t.Cli)' not found, skipped" 'WARN'
+            Set-HiResult -Provider $t.Provider -SlotKey $SlotKey -Ok $false
+            continue
+        }
+        $out = Join-Path $env:TEMP "aiusagebar_hi_$($t.Cli).out"
+        $err = Join-Path $env:TEMP "aiusagebar_hi_$($t.Cli).err"
+        $inp = Join-Path $env:TEMP "aiusagebar_hi_$($t.Cli).in"   # empty stdin so CLIs never wait for input
+        try {
+            Set-Content -LiteralPath $inp -Value '' -NoNewline
+            $proc = Start-Process -FilePath $exe -ArgumentList $t.Args -WorkingDirectory $env:TEMP -WindowStyle Hidden `
+                -RedirectStandardInput $inp -RedirectStandardOutput $out -RedirectStandardError $err -PassThru -ErrorAction Stop
+            # Touching Handle keeps the exit code readable after the process exits (PowerShell quirk).
+            $null = $proc.Handle
+            $started += @{ Provider = $t.Provider; SlotKey = $SlotKey; Process = $proc; Out = $out; Err = $err; Started = [DateTime]::UtcNow }
+            Write-Log "Hi: sent to $($t.Provider) via $exe"
+        } catch {
+            Write-Log "Hi: $($t.Provider) failed to start: $($_.Exception.Message)" 'ERROR'
+            Set-HiResult -Provider $t.Provider -SlotKey $SlotKey -Ok $false
+        }
+    }
+    return $started
+}
+
+function Complete-HiJob {
+    # Logs and records the outcome once the CLI exits (or kills it after 3 minutes). Returns $true when finished.
+    param($Job)
+    if (-not $Job.Process.HasExited) {
+        if (([DateTime]::UtcNow - $Job.Started).TotalSeconds -lt 180) { return $false }
+        try { $Job.Process.Kill() } catch {}
+        Write-Log "Hi: $($Job.Provider) timed out after 180s" 'WARN'
+        Set-HiResult -Provider $Job.Provider -SlotKey $Job.SlotKey -Ok $false
+        return $true
+    }
+    $reply = ''
+    try { $reply = (Get-Content -LiteralPath $Job.Out -Raw -ErrorAction Stop).Trim() } catch {}
+    if ($reply.Length -gt 80) { $reply = $reply.Substring(0, 80) }
+    $ok = ($Job.Process.ExitCode -eq 0)
+    if ($ok) {
+        Write-Log "Hi: $($Job.Provider) OK reply='$reply'"
+    } else {
+        $detail = ''
+        try { $detail = (Get-Content -LiteralPath $Job.Err -Raw -ErrorAction Stop).Trim() } catch {}
+        if ($detail.Length -gt 200) { $detail = $detail.Substring(0, 200) }
+        Write-Log "Hi: $($Job.Provider) exit=$($Job.Process.ExitCode) $detail" 'WARN'
+    }
+    Set-HiResult -Provider $Job.Provider -SlotKey $Job.SlotKey -Ok $ok
+    foreach ($f in @($Job.Out, $Job.Err)) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
+    return $true
+}
+
+function Invoke-HiTick {
+    # Called by a 15s timer: reaps finished pings, fires a due slot once, refreshes the panel.
+    Reset-HiStateIfNewDay
+    $script:HiJobs = @($script:HiJobs | Where-Object { -not (Complete-HiJob $_) })
+    $now = Get-Date
+    foreach ($slot in $script:HiSlots) {
+        if ($script:HiState.Slots.ContainsKey($slot)) { continue }
+        $due = [DateTime]::ParseExact($slot, 'HH:mm', $null).TimeOfDay
+        $dueAt = $now.Date + $due
+        if ($now -lt $dueAt -or $now -gt $dueAt.AddMinutes($script:HiGraceMinutes)) { continue }
+        # Record first so a crash or slow CLI can never cause a second ping for the same slot.
+        $script:HiState.Slots[$slot] = @{ Fired = $now.ToString('HH:mm'); Results = @{} }
+        Save-HiState
+        Write-Log "Hi: slot $slot due"
+        $script:HiJobs = @($script:HiJobs) + @(Start-DailyHi -SlotKey $slot)
+        break
+    }
+    Update-HiPanel
+}
+
+function Invoke-HiManual {
+    if (@($script:HiJobs).Count -gt 0) { Write-Log 'Hi: ping already running, ignored' 'WARN'; return }
+    Write-Log 'Hi: manual ping'
+    $script:HiJobs = @(Start-DailyHi -SlotKey 'manual')
+    Update-HiPanel
+}
+
+function Get-HiSlotStatus {
+    # Returns OK / FAIL / RUN for fired slots, NEXT / WAIT before due time, MISS if it passed unsent.
+    param([string]$Slot, [string]$NextSlot)
+    if ($script:HiState.Slots.ContainsKey($Slot)) {
+        $results = $script:HiState.Slots[$Slot].Results
+        if (@($results.Values | Where-Object { -not $_.Ok }).Count -gt 0) { return 'FAIL' }
+        if ($results.Count -lt @(Get-HiTargets).Count) { return 'RUN' }
+        return 'OK'
+    }
+    $dueAt = (Get-Date).Date + [DateTime]::ParseExact($Slot, 'HH:mm', $null).TimeOfDay
+    if ((Get-Date) -ge $dueAt) { return 'MISS' }
+    if ($Slot -eq $NextSlot) { return 'NEXT' }
+    return 'WAIT'
+}
+
+function Get-HiNext {
+    # Next slot that has not fired yet (tomorrow's first slot once today's are done).
+    $now = Get-Date
+    foreach ($slot in $script:HiSlots) {
+        $dueAt = $now.Date + [DateTime]::ParseExact($slot, 'HH:mm', $null).TimeOfDay
+        if ($dueAt -gt $now) { return @{ Slot = $slot; At = $dueAt; Today = $true } }
+    }
+    $first = $script:HiSlots[0]
+    return @{ Slot = $first; At = $now.Date.AddDays(1) + [DateTime]::ParseExact($first, 'HH:mm', $null).TimeOfDay; Today = $false }
+}
+
+function New-HiPanelBar {
+    # Terminal-style panel: next ping, the four daily slots with their state, and the last result per provider.
+    param($Menu)
+    $mono = New-Object System.Drawing.Font('Consolas', 9.5, [System.Drawing.FontStyle]::Bold)
+    $bg = $Menu.BackColor
+    $fg = $Menu.ForeColor
+    $makeLabel = {
+        param($text, $align)
+        $l = New-Object System.Windows.Forms.Label
+        $l.Text = $text
+        $l.Dock = [System.Windows.Forms.DockStyle]::Fill
+        $l.Margin = [System.Windows.Forms.Padding]::new(0)
+        $l.TextAlign = $align
+        $l.BackColor = $bg
+        $l.ForeColor = $fg
+        $l.Font = $mono
+        return $l
+    }
+    $newTable = {
+        param($cols, $height)
+        $t = New-Object System.Windows.Forms.TableLayoutPanel
+        $t.ColumnCount = $cols
+        $t.RowCount = 1
+        $t.Height = $height
+        $t.Dock = [System.Windows.Forms.DockStyle]::Top
+        $t.Margin = [System.Windows.Forms.Padding]::new(0)
+        $t.Padding = [System.Windows.Forms.Padding]::new(0)
+        $t.BackColor = $bg
+        foreach ($i in 1..$cols) { $t.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, (100.0 / $cols)))) | Out-Null }
+        $t.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100))) | Out-Null
+        return $t
+    }
+
+    $ui = @{ Slots = @(); Providers = @{} }
+    $head = & $newTable 2 24
+    $ui.Title = & $makeLabel 'DAILY HI' ([System.Drawing.ContentAlignment]::MiddleLeft)
+    $ui.Next = & $makeLabel 'NEXT --' ([System.Drawing.ContentAlignment]::MiddleRight)
+    $head.Controls.Add($ui.Title, 0, 0)
+    $head.Controls.Add($ui.Next, 1, 0)
+
+    $slots = & $newTable $script:HiSlots.Count 44
+    $col = 0
+    foreach ($slot in $script:HiSlots) {
+        $l = & $makeLabel $slot ([System.Drawing.ContentAlignment]::MiddleCenter)
+        $l.Margin = [System.Windows.Forms.Padding]::new(2, 2, 2, 2)
+        $ui.Slots += $l
+        $slots.Controls.Add($l, $col, 0)
+        $col++
+    }
+
+    $targets = @(Get-HiTargets)
+    $provs = & $newTable $targets.Count 26
+    $col = 0
+    foreach ($t in $targets) {
+        $l = & $makeLabel $t.Provider ([System.Drawing.ContentAlignment]::MiddleCenter)
+        $ui.Providers[$t.Provider] = $l
+        $provs.Controls.Add($l, $col, 0)
+        $col++
+    }
+
+    $panel = New-Object System.Windows.Forms.Panel
+    $panel.BackColor = $bg
+    $panel.Padding = [System.Windows.Forms.Padding]::new(8, 4, 8, 4)
+    $panel.Height = 24 + 44 + 26 + 8
+    # Docked bottom-up so the first-added control ends up on top.
+    $panel.Controls.Add($provs)
+    $panel.Controls.Add($slots)
+    $panel.Controls.Add($head)
+    $script:HiUi = $ui
+
+    $bar = [System.Windows.Forms.ToolStripControlHost]::new($panel)
+    $bar.AutoSize = $false
+    $bar.Margin = [System.Windows.Forms.Padding]::new(0)
+    $bar.Padding = [System.Windows.Forms.Padding]::new(0)
+    Update-HiPanel
+    return $bar
+}
+
+function Update-HiPanel {
+    if (-not $script:HiUi) { return }
+    $c = { param($hex) [System.Drawing.ColorTranslator]::FromHtml($hex) }
+    $next = Get-HiNext
+    $left = $next.At - (Get-Date)
+    $in = if ($left.TotalHours -ge 1) { '{0}H {1}M' -f [int][math]::Floor($left.TotalHours), $left.Minutes } else { '{0}M' -f [math]::Max(0, [int][math]::Ceiling($left.TotalMinutes)) }
+    $script:HiUi.Next.Text = "NEXT $($next.Slot) IN $in"
+    $script:HiUi.Next.ForeColor = & $c '#ffd166'
+
+    $nextToday = if ($next.Today) { $next.Slot } else { '' }
+    for ($i = 0; $i -lt $script:HiSlots.Count; $i++) {
+        $slot = $script:HiSlots[$i]
+        $status = Get-HiSlotStatus $slot $nextToday
+        $label = $script:HiUi.Slots[$i]
+        $label.Text = "$slot`r`n$status"
+        switch ($status) {
+            'OK'   { $label.BackColor = & $c '#0b3a26'; $label.ForeColor = & $c '#7dffd0' }
+            'FAIL' { $label.BackColor = & $c '#3a0f16'; $label.ForeColor = & $c '#ff5d73' }
+            'RUN'  { $label.BackColor = & $c '#3a2e0a'; $label.ForeColor = & $c '#ffd166' }
+            'NEXT' { $label.BackColor = & $c '#4a3508'; $label.ForeColor = & $c '#ffb347' }
+            'MISS' { $label.BackColor = & $c '#1a1a14'; $label.ForeColor = & $c '#8a7a55' }
+            default { $label.BackColor = & $c '#06180f'; $label.ForeColor = & $c '#3f7a64' }
+        }
+    }
+
+    $running = @($script:HiJobs | ForEach-Object { $_.Provider })
+    foreach ($t in Get-HiTargets) {
+        $label = $script:HiUi.Providers[$t.Provider]
+        $short = $t.Provider.ToUpper()
+        if ($short -eq 'ANTIGRAVITY') { $short = 'AGY' }
+        $last = $script:HiState.Last[$t.Provider]
+        if ($running -contains $t.Provider) {
+            $label.Text = "$short ..."; $label.ForeColor = & $c '#ffd166'
+        } elseif ($last) {
+            $mark = if ($last.Ok) { 'OK' } else { 'FAIL' }
+            $label.Text = "$short $mark $($last.Time)"
+            $label.ForeColor = if ($last.Ok) { & $c '#7dffd0' } else { & $c '#ff5d73' }
+        } else {
+            $label.Text = "$short --"; $label.ForeColor = & $c '#3f7a64'
+        }
+    }
+}
+
+function New-PixelFooterBar {
+    # Ping now / Refresh Now / Open Log / Exit on a single row instead of three stacked menu items.
+    param($Menu)
+    $panel = New-Object System.Windows.Forms.TableLayoutPanel
+    $panel.ColumnCount = 4
+    $panel.RowCount = 1
+    $panel.Height = 28
+    $panel.Margin = [System.Windows.Forms.Padding]::new(0)
+    $panel.Padding = [System.Windows.Forms.Padding]::new(0)
+    $panel.BackColor = $Menu.BackColor
+    foreach ($i in 0..3) { $panel.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 25))) | Out-Null }
+    $panel.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100))) | Out-Null
+    $buttons = @(
+        @{ Text = 'Ping now';    Action = 'ActionPingNow' },
+        @{ Text = 'Refresh Now'; Action = 'ActionRefresh' },
+        @{ Text = 'Open Log';    Action = 'ActionOpenLog' },
+        @{ Text = 'Exit';        Action = 'ActionExit' }
+    )
+    $col = 0
+    foreach ($b in $buttons) {
+        $label = New-Object System.Windows.Forms.Label
+        $label.Text = $b.Text
+        $label.Dock = [System.Windows.Forms.DockStyle]::Fill
+        $label.Margin = [System.Windows.Forms.Padding]::new(0)
+        $label.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+        $label.BackColor = $Menu.BackColor
+        $label.ForeColor = $Menu.ForeColor
+        $label.Font = $Menu.Font
+        $label.Cursor = [System.Windows.Forms.Cursors]::Hand
+        $label.Tag = $b.Action
+        $label.Add_MouseEnter({ param($s, $e) $s.BackColor = [System.Drawing.ColorTranslator]::FromHtml('#0b2a1d') })
+        $label.Add_MouseLeave({ param($s, $e) $s.BackColor = $script:PopupMenu.BackColor })
+        $label.Add_Click({
+            param($s, $e)
+            $script:PopupMenu.Close()
+            & (Get-Variable -Name $s.Tag -Scope Script -ValueOnly)
+        })
+        $panel.Controls.Add($label, $col, 0)
+        $col++
+    }
+    $bar = [System.Windows.Forms.ToolStripControlHost]::new($panel)
+    $bar.AutoSize = $false
+    $bar.Margin = [System.Windows.Forms.Padding]::new(0)
+    $bar.Padding = [System.Windows.Forms.Padding]::new(0)
+    return $bar
+}
+
 # --- Main Application ---
 function Start-AIUsageBarTray {
     [System.Windows.Forms.Application]::EnableVisualStyles()
@@ -1678,30 +2083,26 @@ function Start-AIUsageBarTray {
     $separator2 = New-Object System.Windows.Forms.ToolStripSeparator
     $separator3 = New-Object System.Windows.Forms.ToolStripSeparator
 
-    $refreshItem = New-Object System.Windows.Forms.ToolStripMenuItem("Refresh Now")
-    $refreshItem.Add_Click({
+    $script:ActionRefresh = {
         $script:ClaudeNextAttempt = [DateTime]::MinValue
         Request-AntigravityRefresh
         Update-Usage
-    })
-
-    $openLogItem = New-Object System.Windows.Forms.ToolStripMenuItem("Open Log")
-    $openLogItem.Add_Click({ Start-Process notepad.exe $script:LogFile })
-
-    $exitItem = New-Object System.Windows.Forms.ToolStripMenuItem("Exit")
-    $exitItem.Add_Click({
+    }
+    $script:ActionPingNow = { Invoke-HiManual }
+    $script:ActionOpenLog = { Start-Process notepad.exe $script:LogFile }
+    $script:ActionExit = {
         Stop-AntigravityPoll
         $script:NotifyIcon.Visible = $false
         $script:NotifyIcon.Dispose()
         [System.Windows.Forms.Application]::Exit()
-    })
+    }
 
     Set-PixelMenuAppearance $contextMenu
     $contextMenu.Items.Add((Initialize-PixelUsageView)) | Out-Null
     $contextMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
-    $contextMenu.Items.Add($refreshItem) | Out-Null
-    $contextMenu.Items.Add($openLogItem) | Out-Null
-    $contextMenu.Items.Add($exitItem) | Out-Null
+    $contextMenu.Items.Add((New-HiPanelBar $contextMenu)) | Out-Null
+    $contextMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
+    $contextMenu.Items.Add((New-PixelFooterBar $contextMenu)) | Out-Null
     Resize-PixelPopup $contextMenu
 
     $script:PopupMenu = $contextMenu
@@ -1728,6 +2129,12 @@ function Start-AIUsageBarTray {
             Update-Usage
         }
     })
+
+    # Daily "hi" ping scheduler (also reaps finished pings)
+    $script:HiTimer = New-Object System.Windows.Forms.Timer
+    $script:HiTimer.Interval = 15000
+    $script:HiTimer.Add_Tick({ Invoke-HiTick })
+    $script:HiTimer.Start()
 
     # Initial fetch
     Update-Usage
@@ -1965,5 +2372,12 @@ function Update-Usage {
 Write-Log "=== AIUsageBar for Windows v1.1.4 ==="
 Write-Log "Config dir: $script:ConfigDir"
 Write-Log "Poll interval: ${PollIntervalSeconds}s"
+
+Initialize-HiState
+if ($SendHiNow) {
+    $jobs = @(Start-DailyHi -SlotKey 'manual')
+    foreach ($j in $jobs) { $j.Process.WaitForExit(180000) | Out-Null; Complete-HiJob $j | Out-Null }
+    exit 0
+}
 
 Start-AIUsageBarTray
